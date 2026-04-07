@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+sentence-transformers
+tqdm
+faiss-cpu
+numpy

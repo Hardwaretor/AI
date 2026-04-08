@@ -37,19 +37,38 @@ except Exception:
     faiss = None
 
 DEFAULT_MODEL = "all-MiniLM-L6-v2"
+DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; threejs-indexer/1.0)"}
 
 
-def fetch_links(start_url: str, max_pages: int = 300) -> list[str]:
+def safe_get(session: requests.Session, url: str, timeout: int = 10, retries: int = 3, backoff: float = 1.0, headers: dict | None = None):
+    """GET with simple retries and exponential backoff. Returns Response or raises."""
+    hdrs = DEFAULT_HEADERS.copy()
+    if headers:
+        hdrs.update(headers)
+    for attempt in range(1, retries + 1):
+        try:
+            r = session.get(url, timeout=timeout, headers=hdrs)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            if attempt == retries:
+                raise
+            sleep_t = backoff * (2 ** (attempt - 1))
+            print(f"warning: request failed ({e}), retry {attempt}/{retries} after {sleep_t}s")
+            time.sleep(sleep_t)
+
+
+def fetch_links(start_url: str, max_pages: int = 300, session: requests.Session | None = None, timeout: int = 10, retries: int = 3, backoff: float = 1.0) -> list[str]:
     to_visit = [start_url]
     visited = set()
     collected = []
+    sess = session or requests.Session()
     while to_visit and len(visited) < max_pages:
         url = to_visit.pop(0)
         if url in visited:
             continue
         try:
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
+            r = safe_get(sess, url, timeout=timeout, retries=retries, backoff=backoff)
         except Exception as e:
             print(f"skip {url}: {e}")
             visited.add(url)
@@ -79,6 +98,34 @@ def extract_text(html: str) -> str:
         if t:
             parts.append(t)
     return "\n".join(parts)
+
+
+def extract_anchor_texts_from_soup(soup: BeautifulSoup, base_url: str) -> list[dict]:
+    """Find header anchors (h1/h2/h3 with id) and extract their content as separate documents.
+
+    Returns list of {"url": base_url + '#' + id, "text": extracted_text}
+    """
+    main = soup.find("main") or soup.find("div", {"id": "content"}) or soup
+    results = []
+    # Find headers with id attributes
+    headers = main.find_all(["h1", "h2", "h3"])
+    for header in headers:
+        if not header.has_attr("id"):
+            continue
+        anchor_id = header["id"]
+        parts = [header.get_text(separator=" ", strip=True)]
+        # collect following siblings until the next header of same or higher level
+        for sib in header.next_siblings:
+            if getattr(sib, "name", None) in ("h1", "h2", "h3"):
+                break
+            if getattr(sib, "get_text", None):
+                t = sib.get_text(separator=" ", strip=True)
+                if t:
+                    parts.append(t)
+        text = "\n".join(parts)
+        url = f"{base_url}#{anchor_id}"
+        results.append({"url": url, "text": text})
+    return results
 
 
 def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[str]:
@@ -140,23 +187,41 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     print("Recolectando URLs desde:", args.start_url)
-    urls = fetch_links(args.start_url, max_pages=args.max_pages)
+    sess = requests.Session()
+    urls = fetch_links(args.start_url, max_pages=args.max_pages, session=sess, timeout=10, retries=3, backoff=1.0)
     print(f"URLs recolectadas: {len(urls)}")
+    # Attempt to extract anchored sections from the start page (e.g., #AnimationAction)
+    anchors_map: dict = {}
+    try:
+        r_start = safe_get(sess, args.start_url, timeout=15, retries=3, backoff=1.0)
+        soup_start = BeautifulSoup(r_start.text, "html.parser")
+        anchor_texts = extract_anchor_texts_from_soup(soup_start, args.start_url)
+        if anchor_texts:
+            print(f"Anchors found on start page: {len(anchor_texts)}; indexing anchors instead of top-level links.")
+            # override urls with anchored pseudo-URLs
+            urls = [a["url"] for a in anchor_texts]
+            for a in anchor_texts:
+                anchors_map[a["url"]] = a["text"]
+    except Exception as e:
+        print("No se pudieron extraer anchors del start page:", e)
 
     docs = []
     for url in tqdm(urls, desc="Descargando"):
         try:
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
+            if url in anchors_map:
+                # use pre-extracted anchor text from the start page
+                text = anchors_map[url]
+            else:
+                r = safe_get(sess, url, timeout=15, retries=3, backoff=1.0)
+                # throttle requests to avoid overloading the machine/network
+                try:
+                    time.sleep(args.delay)
+                except Exception:
+                    pass
+                text = extract_text(r.text)
         except Exception as e:
             print(f"fallo {url}: {e}")
             continue
-        # throttle requests to avoid overloading the machine/network
-        try:
-            time.sleep(args.delay)
-        except Exception:
-            pass
-        text = extract_text(r.text)
         if not text:
             continue
         chunks = chunk_text(text, chunk_size=args.chunk_size, overlap=args.overlap)

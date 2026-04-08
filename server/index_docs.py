@@ -183,27 +183,105 @@ def main():
     parser.add_argument("--embed-batch", type=int, default=32, help="Tamaño de lote para generar embeddings")
     parser.add_argument("--download-only", action="store_true", help="Solo descargar y guardar textos crudos sin generar embeddings")
     parser.add_argument("--delay", type=float, default=0.5, help="Segundos de retardo entre peticiones HTTP para reducir carga (default 0.5)")
+    parser.add_argument("--anchors-file", default=None, help="Ruta a archivo con lista de anchor ids (una por línea) para procesar directamente")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     print("Recolectando URLs desde:", args.start_url)
     sess = requests.Session()
+    # If anchors-file provided, read anchors list and process those specific anchors
+    anchors_list = None
+    if args.anchors_file:
+        try:
+            with open(args.anchors_file, "r", encoding="utf-8") as f:
+                anchors_list = [l.strip() for l in f.readlines() if l.strip()]
+            print(f"Loaded {len(anchors_list)} anchors from {args.anchors_file}")
+        except Exception as e:
+            print(f"Could not read anchors file {args.anchors_file}: {e}")
+            anchors_list = None
+
+    # Always crawl docs pages first (we'll decide later whether to index full pages or only anchors)
     urls = fetch_links(args.start_url, max_pages=args.max_pages, session=sess, timeout=10, retries=3, backoff=1.0)
     print(f"URLs recolectadas: {len(urls)}")
     # Attempt to extract anchored sections from the start page (e.g., #AnimationAction)
     anchors_map: dict = {}
+    # Try extracting anchored sections from the main start page first (existing behaviour)
     try:
         r_start = safe_get(sess, args.start_url, timeout=15, retries=3, backoff=1.0)
         soup_start = BeautifulSoup(r_start.text, "html.parser")
-        anchor_texts = extract_anchor_texts_from_soup(soup_start, args.start_url)
-        if anchor_texts:
-            print(f"Anchors found on start page: {len(anchor_texts)}; indexing anchors instead of top-level links.")
-            # override urls with anchored pseudo-URLs
-            urls = [a["url"] for a in anchor_texts]
-            for a in anchor_texts:
-                anchors_map[a["url"]] = a["text"]
+        if anchors_list is None:
+            anchor_texts = extract_anchor_texts_from_soup(soup_start, args.start_url)
+            if anchor_texts:
+                print(f"Anchors found on start page: {len(anchor_texts)}; indexing anchors instead of top-level links.")
+                urls = [a["url"] for a in anchor_texts]
+                for a in anchor_texts:
+                    anchors_map[a["url"]] = a["text"]
+        else:
+            # If user requested specific anchors, first try to find them on the start page
+            for a in anchors_list:
+                el = soup_start.find(id=a)
+                if el is not None:
+                    parts = [el.get_text(separator=" ", strip=True)]
+                    for sib in el.next_siblings:
+                        if getattr(sib, "name", None) in ("h1", "h2", "h3"):
+                            break
+                        if getattr(sib, "get_text", None):
+                            t = sib.get_text(separator=" ", strip=True)
+                            if t:
+                                parts.append(t)
+                    text = "\n".join(parts)
+                    url = f"{args.start_url}#{a}"
+                    anchors_map[url] = text
+                else:
+                    # defer detailed searching across collected pages below
+                    pass
     except Exception as e:
         print("No se pudieron extraer anchors del start page:", e)
+
+    # If user provided an anchors file, search the crawled pages for those anchor ids
+    if anchors_list is not None:
+        anchors_to_find = set(anchors_list)
+        # remove any already-found anchors (from start page)
+        for k in list(anchors_map.keys()):
+            # anchor id is after '#'
+            try:
+                anchors_to_find.discard(k.split("#", 1)[1])
+            except Exception:
+                pass
+
+        if anchors_to_find:
+            print(f"Searching {len(anchors_to_find)} requested anchors across {len(urls)} crawled pages...")
+            for page_url in tqdm(urls, desc="Buscando anchors"):
+                if not anchors_to_find:
+                    break
+                try:
+                    r = safe_get(sess, page_url, timeout=15, retries=2, backoff=1.0)
+                except Exception:
+                    continue
+                soup = BeautifulSoup(r.text, "html.parser")
+                for anchor_id in list(anchors_to_find):
+                    el = soup.find(id=anchor_id)
+                    if el is not None:
+                        parts = [el.get_text(separator=" ", strip=True)]
+                        for sib in el.next_siblings:
+                            if getattr(sib, "name", None) in ("h1", "h2", "h3"):
+                                break
+                            if getattr(sib, "get_text", None):
+                                t = sib.get_text(separator=" ", strip=True)
+                                if t:
+                                    parts.append(t)
+                        text = "\n".join(parts)
+                        url_with_frag = f"{page_url}#{anchor_id}"
+                        anchors_map[url_with_frag] = text
+                        anchors_to_find.discard(anchor_id)
+
+        if anchors_map:
+            # index only the anchors we found
+            urls = list(anchors_map.keys())
+        else:
+            # nothing found: fallback to pseudo-URLs pointing at the start page (original behaviour)
+            print("No se encontraron anchors en las páginas rastreadas; usando start page pseudo-URLs.")
+            urls = [f"{args.start_url}#{a}" for a in anchors_list]
 
     docs = []
     for url in tqdm(urls, desc="Descargando"):
